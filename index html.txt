@@ -1,0 +1,1776 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs } from 'firebase/firestore';
+
+// Tailwind CSS est supposé être disponible
+// Pour assurer une police "Inter" cohérente sur toute l'application,
+// assurez-vous d'avoir la ligne suivante dans la section <head> de votre fichier public/index.html :
+// <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+// Et pour un affichage mobile correct, assurez-vous également d'avoir :
+// <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+
+// Styles pour les barres de défilement personnalisées (pour une meilleure UX)
+// Ces styles sont intégrés ici pour l'exemple, mais peuvent être déplacés dans un fichier CSS externe
+// ou configurés via un plugin Tailwind si vous utilisez PostCSS.
+const CustomScrollbarStyles = () => (
+    <style>
+        {`
+        /* Pour les navigateurs Webkit (Chrome, Safari) */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            height: 8px; /* Pour les barres de défilement horizontales */
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background-color: #94a3b8; /* gray-400 */
+            border-radius: 4px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background-color: #f1f5f9; /* gray-100 */
+        }
+
+        /* Pour Firefox */
+        .custom-scrollbar {
+            scrollbar-width: thin;
+            scrollbar-color: #94a3b8 #f1f5f9;
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .animate-fade-in {
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        @keyframes pulseOnce {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.01); opacity: 0.95; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        .animate-pulse-once {
+            animation: pulseOnce 1.5s ease-in-out;
+        }
+        `}
+    </style>
+);
+
+
+// Utility function for custom confirmation/alert dialogs
+const CustomDialog = ({ message, onConfirm, onCancel, showConfirm = true, inputType, defaultValue, confirmText }) => {
+    const [inputValue, setInputValue] = useState(defaultValue || '');
+
+    const handleConfirm = () => {
+        onConfirm(inputValue); // Pass the internal input value
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 font-inter">
+            <div className="bg-white rounded-lg p-6 shadow-xl max-w-sm w-full mx-auto">
+                <p className="text-lg font-semibold text-gray-800 mb-4 text-center">{message}</p>
+                {inputType === 'number' && (
+                    <input
+                        type="number"
+                        value={inputValue}
+                        onChange={(e) => setInputValue(e.target.value)}
+                        className="mt-2 mb-4 p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                        min="1"
+                        step="1"
+                        autoFocus // Automatically focus the input field
+                    />
+                )}
+                <div className="flex justify-around space-x-4">
+                    {showConfirm && (
+                        <button
+                            onClick={handleConfirm} // Use the internal handleConfirm
+                            className="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md hover:shadow-lg transform hover:scale-105"
+                        >
+                            {confirmText || 'Confirmer'}
+                        </button>
+                    )}
+                    <button
+                        onClick={onCancel}
+                        className="flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md hover:shadow-lg transform hover:scale-105"
+                    >
+                        {showConfirm ? 'Annuler' : 'Fermer'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const App = () => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState('');
+    const [loading, setLoading] = useState(true);
+    const [activeTab, setActiveTab] = useState('vente'); // 'vente', 'inventaire', 'achatsmarchandise', 'dépenses', 'caisse', 'pertes', 'bilan'
+    const [dialog, setDialog] = useState(null); // { message, onConfirm, onCancel, showConfirm, inputType, defaultValue, confirmText }
+    const [isGeneratingPdf, setIsGeneratingPdf] = useState(false); // New state for PDF generation loading
+
+    const [products, setProducts] = useState([]);
+    const [cart, setCart] = useState([]);
+    const [salesHistory, setSalesHistory] = useState([]);
+    const [purchaseHistory, setPurchaseHistory] = useState([]);
+    const [expenses, setExpenses] = useState([]);
+    const [cashCounts, setCashCounts] = useState([]);
+    const [lossHistory, setLossHistory] = useState([]);
+    const [pdfLibrariesLoaded, setPdfLibrariesLoaded] = useState(false);
+    // Removed cumulativeTheoreticalGrossProfit
+    const [cumulativeCashInRegister, setCumulativeCashInRegister] = useState(0);
+
+    const [paymentAmountGiven, setPaymentAmountGiven] = useState('');
+    const [cashDenominations, setCashDenominations] = useState({
+        '10000': 0, '5000': 0, '1000': 0, '500': 0,
+        '200': 0, '100': 0, '50': 0, '20': 0, '10': 0, '5': 0, '2': 0, '1': 0,
+    });
+    const [newLoss, setNewLoss] = useState({ productId: '', quantity: '' });
+    const [newExpense, setNewExpense] = useState({ supplierName: '', details: '', totalAmount: '' });
+    const [newPurchase, setNewPurchase] = useState({ supplierName: '', totalAmount: '', productsToUpdate: {} });
+
+    // State for low stock alerts
+    const [lowStockProducts, setLowStockProducts] = useState([]);
+
+
+    // Load PDF export libraries
+    useEffect(() => {
+        const jspdfScript = document.createElement('script');
+        jspdfScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+        jspdfScript.async = true;
+
+        const html2canvasScript = document.createElement('script');
+        html2canvasScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+        html2canvasScript.async = true;
+
+        let scriptsLoaded = 0;
+        const totalScripts = 2;
+
+        const handleScriptLoad = () => {
+            scriptsLoaded++;
+            if (scriptsLoaded === totalScripts) {
+                setPdfLibrariesLoaded(true);
+            }
+        };
+
+        jspdfScript.onload = handleScriptLoad;
+        html2canvasScript.onload = handleScriptLoad;
+
+        document.body.appendChild(jspdfScript);
+        document.body.appendChild(html2canvasScript);
+
+        return () => {
+            document.body.removeChild(jspdfScript);
+            document.body.removeChild(html2canvasScript);
+        };
+    }, []);
+
+    // Firebase Initialization
+    useEffect(() => {
+        try {
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+            if (!firebaseConfig.apiKey) {
+                console.error("Firebase config is missing API Key. Check __firebase_config.");
+                setLoading(false);
+                return;
+            }
+
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                    console.log("Firebase initialized and userId:", user.uid);
+                    // Load cumulative cash in register after user is set
+                    const appStateDocRef = doc(firestoreDb, `artifacts/${appId}/users/${user.uid}/appState/cumulative_data`);
+                    const appStateSnap = await getDoc(appStateDocRef);
+                    if (appStateSnap.exists()) {
+                        const data = appStateSnap.data();
+                        // Removed cumulativeTheoreticalGrossProfit loading
+                        setCumulativeCashInRegister(data.cumulativeCashInRegister || 0);
+                    } else {
+                        await setDoc(appStateDocRef, { cumulativeCashInRegister: 0 }); // Only initialize cash
+                        // Removed cumulativeTheoreticalGrossProfit initialization
+                        setCumulativeCashInRegister(0);
+                    }
+                } else {
+                    try {
+                        const token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                        if (token) {
+                            await signInWithCustomToken(firebaseAuth, token);
+                        } else {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    } catch (signInError) {
+                        console.error("Erreur d'authentification:", signInError);
+                        setDialog({
+                            message: "Échec de la connexion. Certaines fonctionnalités pourraient être limitées. " + signInError.message,
+                            onCancel: () => setDialog(null),
+                            showConfirm: false
+                        });
+                    }
+                }
+                setLoading(false);
+            });
+        } catch (error) {
+            console.error("Erreur lors de l'initialisation de Firebase:", error);
+            setDialog({
+                message: "Erreur critique lors du chargement de l'application. Veuillez réessayer. " + error.message,
+                onCancel: () => setDialog(null),
+                showConfirm: false
+            });
+            setLoading(false);
+        }
+    }, []);
+
+    // Firestore Collection Paths
+    const getProductCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/products`);
+    }, [db, userId]);
+
+    const getSalesCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/sales`);
+    }, [db, userId]);
+
+    const getPurchaseCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/purchases`);
+    }, [db, userId]);
+
+    const getExpensesCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/expenses`);
+    }, [db, userId]);
+
+    const getCashCountCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/cashCounts`);
+    }, [db, userId]);
+
+    const getLossCollection = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return collection(db, `artifacts/${appId}/users/${userId}/losses`);
+    }, [db, userId]);
+
+    const getAppStateDocRef = useCallback(() => {
+        if (!db || !userId) return null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        return doc(db, `artifacts/${appId}/users/${userId}/appState/cumulative_data`);
+    }, [db, userId]);
+
+
+    // Data Listeners
+    useEffect(() => {
+        if (!db || !userId) {
+            console.log("Attempting to fetch data: DB or userId not ready.", { db: !!db, userId: !!userId });
+            return;
+        }
+
+        console.log("Attempting to fetch products with db and userId:", { db: db, userId: userId });
+
+        const unsubscribeProducts = onSnapshot(getProductCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setProducts(data);
+            console.log("Products data received from Firestore:", data);
+        }, (error) => console.error("Error fetching products:", error));
+
+        const unsubscribeSales = onSnapshot(getSalesCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setSalesHistory(data);
+        }, (error) => console.error("Error fetching sales:", error));
+
+        const unsubscribePurchases = onSnapshot(getPurchaseCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setPurchaseHistory(data);
+        }, (error) => console.error("Error fetching purchases:", error));
+
+        const unsubscribeExpenses = onSnapshot(getExpensesCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setExpenses(data);
+        }, (error) => console.error("Error fetching expenses:", error));
+
+        const unsubscribeCashCounts = onSnapshot(getCashCountCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setCashCounts(data);
+        }, (error) => console.error("Error fetching cash counts:", error));
+
+        const unsubscribeLosses = onSnapshot(getLossCollection(), (snapshot) => {
+            const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setLossHistory(data);
+        }, (error) => console.error("Error fetching losses:", error));
+
+        // Listener for cumulative cash in register
+        const unsubscribeCumulativeData = onSnapshot(getAppStateDocRef(), (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                // Removed cumulativeTheoreticalGrossProfit update
+                setCumulativeCashInRegister(data.cumulativeCashInRegister || 0);
+            } else {
+                setCumulativeCashInRegister(0);
+            }
+        }, (error) => console.error("Error fetching cumulative data:", error));
+
+
+        return () => {
+            unsubscribeProducts();
+            unsubscribeSales();
+            unsubscribePurchases();
+            unsubscribeExpenses();
+            unsubscribeCashCounts();
+            unsubscribeLosses();
+            unsubscribeCumulativeData();
+        };
+    }, [db, userId, getProductCollection, getSalesCollection, getPurchaseCollection, getExpensesCollection, getCashCountCollection, getLossCollection, getAppStateDocRef]);
+
+    // Effect to check for low stock products
+    useEffect(() => {
+        const lowStock = products.filter(product =>
+            product.reorderThreshold && product.reorderThreshold > 0 && product.stock <= product.reorderThreshold
+        );
+        setLowStockProducts(lowStock);
+    }, [products]);
+
+
+    // --- Product Management ---
+    // Added reorderThreshold to newProduct state
+    const [newProduct, setNewProduct] = useState({ name: '', price: '', stock: '', reorderThreshold: '' });
+    const [editingProduct, setEditingProduct] = useState(null);
+    const [productSearchTerm, setProductSearchTerm] = useState('');
+
+    const handleAddProduct = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const { name, price, stock, reorderThreshold } = newProduct;
+        if (!name || isNaN(price) || parseFloat(price) <= 0 || isNaN(stock) || parseInt(stock) < 0) {
+            setDialog({ message: "Veuillez remplir tous les champs correctement (prix > 0, stock >= 0).", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+        if (products.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+            setDialog({ message: "Un produit avec ce nom existe déjà.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+        const parsedReorderThreshold = parseInt(reorderThreshold) || 0; // Default to 0 if not provided or invalid
+
+        try {
+            await addDoc(getProductCollection(), {
+                name: name.trim(),
+                price: parseFloat(price),
+                stock: parseInt(stock),
+                reorderThreshold: parsedReorderThreshold, // Save the new field
+            });
+            setNewProduct({ name: '', price: '', stock: '', reorderThreshold: '' });
+            setDialog({ message: "Produit ajouté avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+        } catch (e) {
+            console.error("Erreur lors de l'ajout du produit:", e);
+            setDialog({ message: "Erreur lors de l'ajout du produit.", onCancel: () => setDialog(null), showConfirm: false });
+        }
+    };
+
+    const handleEditProduct = (product) => {
+        // Ensure reorderThreshold is present, default to 0 if not
+        setEditingProduct({ ...product, reorderThreshold: product.reorderThreshold || 0 });
+    };
+
+    const handleUpdateProduct = async () => {
+        if (!db || !editingProduct) return;
+        const { id, name, price, stock, reorderThreshold } = editingProduct;
+
+        if (!name || isNaN(price) || parseFloat(price) <= 0 || isNaN(stock) || parseInt(stock) < 0) {
+            setDialog({ message: "Veuillez remplir tous les champs correctement (prix > 0, stock >= 0).", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const originalProduct = products.find(p => p.id === id);
+        if (originalProduct.name.toLowerCase() !== name.toLowerCase() && products.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+            setDialog({ message: "Un autre produit avec ce nom existe déjà.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+        const parsedReorderThreshold = parseInt(reorderThreshold) || 0; // Default to 0 if not provided or invalid
+
+        try {
+            await updateDoc(doc(getProductCollection(), id), {
+                name: name.trim(),
+                price: parseFloat(price),
+                stock: parseInt(stock),
+                reorderThreshold: parsedReorderThreshold, // Update the new field
+            });
+            setEditingProduct(null);
+            setDialog({ message: "Produit mis à jour avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+        } catch (e) {
+            console.error("Erreur lors de la mise à jour du produit:", e);
+            setDialog({ message: "Erreur lors de la mise à jour du produit.", onCancel: () => setDialog(null), showConfirm: false });
+        }
+    };
+
+    const handleDeleteProduct = (productId) => {
+        setDialog({
+            message: "Êtes-vous sûr de vouloir supprimer ce produit ? Cette action est irréversible.",
+            onConfirm: async () => {
+                if (!db) {
+                    setDialog(null);
+                    return;
+                }
+                const hasSalesTransactions = salesHistory.some(sale => {
+                    let items;
+                    try {
+                        items = JSON.parse(sale.items);
+                    } catch (e) {
+                        return false;
+                    }
+                    return items.some(item => item.id === productId);
+                });
+                const hasLossTransactions = lossHistory.some(loss => loss.productId === productId);
+
+                if (hasSalesTransactions || hasLossTransactions) {
+                    setDialog({ message: "Impossible de supprimer le produit car il est lié à des transactions passées (ventes ou pertes).", onCancel: () => setDialog(null), showConfirm: false });
+                    return;
+                }
+
+                try {
+                    await deleteDoc(doc(getProductCollection(), productId));
+                    setDialog({ message: "Produit supprimé avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+                } catch (e) {
+                    console.error("Erreur lors de la suppression du produit:", e);
+                    setDialog({ message: "Erreur lors de la suppression du produit.", onCancel: () => setDialog(null), showConfirm: false });
+                }
+                setDialog(null);
+            },
+            onCancel: () => setDialog(null)
+        });
+    };
+
+    const filteredProducts = products.filter(product =>
+        product.name.toLowerCase().includes(productSearchTerm.toLowerCase())
+    );
+
+    // --- Achats Marchandise (New section for Purchases) ---
+    const handleAddPurchase = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const { supplierName, totalAmount, productsToUpdate } = newPurchase;
+        const parsedTotalAmount = parseFloat(totalAmount);
+
+        if (!supplierName || isNaN(parsedTotalAmount) || parsedTotalAmount <= 0) {
+            setDialog({ message: "Veuillez remplir le nom du fournisseur et un montant total valide (> 0).", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const updates = Object.entries(productsToUpdate).filter(([, qty]) => qty > 0);
+        if (updates.length === 0) {
+            setDialog({ message: "Veuillez ajouter au moins une quantité pour un produit.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        try {
+            await addDoc(getPurchaseCollection(), {
+                date: new Date().toISOString(),
+                supplierName: supplierName.trim(),
+                totalAmount: parsedTotalAmount,
+                itemsUpdated: updates.map(([productId, qty]) => {
+                    const product = products.find(p => p.id === productId);
+                    return { productId, name: product?.name, quantity: parseInt(qty) };
+                })
+            });
+
+            // Update cumulative cash in register
+            const appStateDocRef = getAppStateDocRef();
+            if (appStateDocRef) {
+                await updateDoc(appStateDocRef, {
+                    // Removed cumulativeTheoreticalGrossProfit update
+                    cumulativeCashInRegister: cumulativeCashInRegister - parsedTotalAmount
+                });
+            }
+
+            for (const [productId, quantity] of updates) {
+                const productRef = doc(getProductCollection(), productId);
+                const currentProduct = products.find(p => p.id === productId);
+                if (currentProduct) {
+                    await updateDoc(productRef, {
+                        stock: currentProduct.stock + parseInt(quantity)
+                    });
+                }
+            }
+
+            setNewPurchase({ supplierName: '', totalAmount: '', productsToUpdate: {} });
+            setDialog({ message: "Achat enregistré et stock mis à jour avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+        } catch (e) {
+            console.error("Erreur lors de l'ajout de l'achat:", e);
+            setDialog({ message: "Erreur lors de l'enregistrement de l'achat.", onCancel: () => setDialog(null), showConfirm: false });
+        }
+    };
+    
+    // --- Dépenses (Expenses) ---
+    const handleAddExpense = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const { supplierName, details, totalAmount } = newExpense;
+        const parsedTotalAmount = parseFloat(totalAmount);
+
+        if (!supplierName || !details || isNaN(parsedTotalAmount) || parsedTotalAmount <= 0) {
+            setDialog({ message: "Veuillez remplir tous les champs correctement pour la dépense.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        try {
+            await addDoc(getExpensesCollection(), {
+                date: new Date().toISOString(),
+                supplierName: supplierName.trim(),
+                details: details.trim(),
+                totalAmount: parsedTotalAmount,
+            });
+
+            // Update cumulative cash in register
+            const appStateDocRef = getAppStateDocRef();
+            if (appStateDocRef) {
+                await updateDoc(appStateDocRef, {
+                    // Removed cumulativeTheoreticalGrossProfit update
+                    cumulativeCashInRegister: cumulativeCashInRegister - parsedTotalAmount
+                });
+            }
+
+            setNewExpense({ supplierName: '', details: '', totalAmount: '' });
+            setDialog({ message: "Dépense enregistrée avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+        } catch (e) {
+            console.error("Erreur lors de l'enregistrement de la dépense:", e);
+            setDialog({ message: "Erreur lors de l'enregistrement de la dépense.", onCancel: () => setDialog(null), showConfirm: false });
+        }
+    };
+
+
+    // --- Vente (Caisse Enregistreuse) ---
+    const handleAddToCart = (product) => {
+        setDialog({
+            message: `Quantité pour ${product.name}:`,
+            onConfirm: (quantityInput) => {
+                const quantity = parseInt(quantityInput);
+                if (isNaN(quantity) || quantity <= 0) {
+                    setDialog({ message: "Veuillez entrer une quantité valide.", onCancel: () => setDialog(null), showConfirm: false });
+                    return;
+                }
+                if (quantity > product.stock) {
+                    setDialog({ message: `Quantité insuffisante. Stock disponible : ${product.stock}.`, onCancel: () => setDialog(null), showConfirm: false });
+                    return;
+                }
+
+                const existingItem = cart.find(item => item.id === product.id);
+                if (existingItem) {
+                    const newQuantity = existingItem.quantity + quantity;
+                    if (newQuantity > product.stock) {
+                        setDialog({ message: `Impossible d'ajouter plus. Stock disponible : ${product.stock}. Total dans le panier : ${existingItem.quantity}.`, onCancel: () => setDialog(null), showConfirm: false });
+                        return;
+                    }
+                    setCart(prevCart => prevCart.map(item =>
+                        item.id === product.id ? { ...item, quantity: newQuantity } : item
+                    ));
+                } else {
+                    setCart(prevCart => [...prevCart, { ...product, quantity }]);
+                }
+                setDialog(null);
+            },
+            onCancel: () => setDialog(null),
+            showConfirm: true,
+            inputType: 'number',
+            defaultValue: 1,
+            confirmText: 'Ajouter au panier'
+        });
+    };
+
+    const updateCartItemQuantity = (id, newQuantity) => {
+        const product = products.find(p => p.id === id);
+        if (!product) return;
+
+        if (newQuantity <= 0) {
+            handleRemoveFromCart(id);
+            return;
+        }
+
+        if (newQuantity > product.stock) {
+            setDialog({ message: `Quantité insuffisante. Stock disponible : ${product.stock}.`, onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        setCart(prevCart => prevCart.map(item =>
+            item.id === id ? { ...item, quantity: newQuantity } : item
+        ));
+    };
+
+    const handleRemoveFromCart = (id) => {
+        setCart(prevCart => prevCart.filter(item => item.id !== id));
+    };
+
+    const calculateCartTotal = () => {
+        return cart.reduce((total, item) => total + (item.price * item.quantity), 0);
+    };
+
+    const handleCancelSale = () => {
+        setDialog({
+            message: "Êtes-vous sûr de vouloir annuler cette vente ? Le panier sera vidé.",
+            onConfirm: () => {
+                setCart([]);
+                setPaymentAmountGiven('');
+                setDialog(null);
+            },
+            onCancel: () => setDialog(null)
+        });
+    };
+
+    const handleValidateSale = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+        if (cart.length === 0) {
+            setDialog({ message: "Le panier est vide. Impossible de valider la vente.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const totalSaleAmount = calculateCartTotal();
+        const amountGiven = parseFloat(paymentAmountGiven);
+
+        if (isNaN(amountGiven) || amountGiven < totalSaleAmount) {
+            setDialog({ message: `Montant donné insuffisant. Total à payer: ${totalSaleAmount.toFixed(2)} XPF.`, onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        try {
+            for (const item of cart) {
+                const productRef = doc(getProductCollection(), item.id);
+                const currentProduct = products.find(p => p.id === item.id);
+                if (currentProduct && currentProduct.stock >= item.quantity) {
+                    await updateDoc(productRef, {
+                        stock: currentProduct.stock - item.quantity
+                    });
+                } else {
+                    throw new Error(`Stock insuffisant pour ${item.name}`);
+                }
+            }
+
+            await addDoc(getSalesCollection(), {
+                date: new Date().toISOString(),
+                items: JSON.stringify(cart.map(item => ({
+                    id: item.id,
+                    name: item.name,
+                    quantity: item.quantity,
+                    price: item.price
+                }))),
+                totalAmount: totalSaleAmount,
+                amountGiven: amountGiven,
+                change: amountGiven - totalSaleAmount,
+            });
+
+            // Update cumulative cash in register
+            const appStateDocRef = getAppStateDocRef();
+            if (appStateDocRef) {
+                await updateDoc(appStateDocRef, {
+                    // Removed cumulativeTheoreticalGrossProfit update
+                    cumulativeCashInRegister: cumulativeCashInRegister + totalSaleAmount
+                });
+            }
+
+            setCart([]);
+            setPaymentAmountGiven('');
+            setDialog({ message: "Vente validée avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+        } catch (e) {
+            console.error("Erreur lors de la validation de la vente:", e);
+            setDialog({ message: "Erreur lors de la validation de la vente: " + e.message, onCancel: () => setDialog(null), showConfirm: false });
+        }
+    };
+
+    const changeToGive = parseFloat(paymentAmountGiven) - calculateCartTotal();
+
+    // --- Gestion de la Trésorerie (Caisse) ---
+    const handleCashDenominationChange = (value, denomination) => {
+        setCashDenominations(prev => ({
+            ...prev,
+            [denomination]: Math.max(0, parseInt(value || '0'))
+        }));
+    };
+
+    const calculatePhysicalCashTotal = () => {
+        return Object.entries(cashDenominations).reduce((total, [denomination, count]) => {
+            return total + (parseFloat(denomination) * count);
+        }, 0);
+    };
+
+    const handleSaveCashCount = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const totalPhysical = calculatePhysicalCashTotal();
+        setDialog({
+            message: `Enregistrer le comptage de caisse de ${totalPhysical.toFixed(2)} XPF ?`,
+            onConfirm: async () => {
+                try {
+                    await addDoc(getCashCountCollection(), {
+                        date: new Date().toISOString(),
+                        denominations: cashDenominations,
+                        totalPhysicalAmount: totalPhysical,
+                    });
+                    setDialog({ message: "Comptage de caisse enregistré avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+                } catch (e) {
+                    console.error("Erreur lors de l'enregistrement du comptage:", e);
+                    setDialog({ message: "Erreur lors de l'enregistrement du comptage de caisse.", onCancel: () => setDialog(null), showConfirm: false });
+                }
+                setDialog(null);
+            },
+            onCancel: () => setDialog(null)
+        });
+    };
+
+    // --- Gestion des Pertes (Losses) ---
+    const handleRecordLoss = async () => {
+        if (!db) {
+            setDialog({ message: "La base de données n'est pas prête.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        const { productId, quantity } = newLoss;
+        const selectedProduct = products.find(p => p.id === productId);
+        const parsedQuantity = parseInt(quantity);
+
+        if (!productId || isNaN(parsedQuantity) || parsedQuantity <= 0 || !selectedProduct) {
+            setDialog({ message: "Veuillez sélectionner un produit et entrer une quantité de perte valide (> 0).", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        if (parsedQuantity > selectedProduct.stock) {
+            setDialog({ message: `Quantité de perte (${parsedQuantity}) dépasse le stock disponible (${selectedProduct.stock}) pour ${selectedProduct.name}.`, onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+
+        setDialog({
+            message: `Enregistrer une perte de ${parsedQuantity} unité(s) de ${selectedProduct.name} ?`,
+            onConfirm: async () => {
+                try {
+                    // Update product stock
+                    const productRef = doc(getProductCollection(), productId);
+                    await updateDoc(productRef, {
+                        stock: selectedProduct.stock - parsedQuantity
+                    });
+
+                    // Record the loss
+                    await addDoc(getLossCollection(), {
+                        date: new Date().toISOString(),
+                        productId: productId,
+                        productName: selectedProduct.name,
+                        quantity: parsedQuantity,
+                        lossAmount: parsedQuantity * selectedProduct.price, // Calculate loss amount based on product price
+                    });
+
+                    setNewLoss({ productId: '', quantity: '' }); // Reset form
+                    setDialog({ message: "Perte enregistrée et stock mis à jour avec succès !", onCancel: () => setDialog(null), showConfirm: false });
+                } catch (e) {
+                    console.error("Erreur lors de l'enregistrement de la perte:", e);
+                    setDialog({ message: "Erreur lors de l'enregistrement de la perte.", onCancel: () => setDialog(null), showConfirm: false });
+                }
+                setDialog(null);
+            },
+            onCancel: () => setDialog(null)
+        });
+    };
+
+    // --- Bilan (Summary/Balance Sheet) ---
+    const calculateGrossProfit = () => {
+        const totalSalesRevenue = salesHistory.reduce((sum, sale) => sum + sale.totalAmount, 0);
+        // Assuming 'cost price' for simplicity is the price at which it's sold, for now.
+        // A more complex system would track actual cost of goods sold.
+        const costOfGoodsSold = salesHistory.reduce((sum, sale) => {
+            const items = JSON.parse(sale.items);
+            return sum + items.reduce((itemSum, item) => itemSum + (item.price * item.quantity), 0);
+        }, 0); // For now, this is identical to totalSalesRevenue.
+              // To calculate actual COGS, we'd need a 'costPrice' field for products and track it per sale.
+        return totalSalesRevenue - costOfGoodsSold;
+    };
+
+    const calculateNetProfit = () => {
+        const totalSalesRevenue = salesHistory.reduce((sum, sale) => sum + sale.totalAmount, 0);
+        const totalExpenses = expenses.reduce((sum, expense) => sum + expense.totalAmount, 0);
+        const totalPurchases = purchaseHistory.reduce((sum, purchase) => sum + purchase.totalAmount, 0);
+        const totalLosses = lossHistory.reduce((sum, loss) => sum + loss.lossAmount, 0); // Assuming lossAmount is tracked
+
+        // Net Profit = (Sales Revenue) - (Cost of Goods Sold) - (Expenses) - (Losses)
+        // For simplicity, using sales revenue as proxy for COGS if no cost price is available.
+        // In a real scenario, COGS would be tracked carefully.
+        return totalSalesRevenue - totalPurchases - totalExpenses - totalLosses;
+    };
+
+    const generatePDFReport = async (reportType) => {
+        if (!pdfLibrariesLoaded) {
+            setDialog({ message: "Les librairies PDF ne sont pas encore chargées. Veuillez patienter.", onCancel: () => setDialog(null), showConfirm: false });
+            return;
+        }
+        setIsGeneratingPdf(true);
+        const { jsPDF } = window.jspdf;
+
+        let title = '';
+        let content = '';
+
+        if (reportType === 'sales') {
+            title = 'Rapport des Ventes';
+            content = `
+                <h2 class="text-2xl font-bold mb-4 text-center">Historique des Ventes</h2>
+                <p class="text-lg mb-2">Total des ventes : ${salesHistory.reduce((sum, sale) => sum + sale.totalAmount, 0).toFixed(2)} XPF</p>
+                <table class="min-w-full bg-white border border-gray-300 rounded-md shadow-sm overflow-hidden">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="py-2 px-4 border-b text-left">Date</th>
+                            <th class="py-2 px-4 border-b text-left">Articles</th>
+                            <th class="py-2 px-4 border-b text-right">Montant Total</th>
+                            <th class="py-2 px-4 border-b text-right">Monnaie Rendue</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${salesHistory.sort((a, b) => new Date(b.date) - new Date(a.date)).map(sale => `
+                            <tr class="hover:bg-gray-50">
+                                <td class="py-2 px-4 border-b">${new Date(sale.date).toLocaleString()}</td>
+                                <td class="py-2 px-4 border-b">
+                                    ${JSON.parse(sale.items).map(item => `${item.name} (x${item.quantity})`).join(', ')}
+                                </td>
+                                <td class="py-2 px-4 border-b text-right">${sale.totalAmount.toFixed(2)} XPF</td>
+                                <td class="py-2 px-4 border-b text-right">${sale.change.toFixed(2)} XPF</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else if (reportType === 'purchases') {
+            title = 'Rapport des Achats de Marchandises';
+            content = `
+                <h2 class="text-2xl font-bold mb-4 text-center">Historique des Achats de Marchandises</h2>
+                <p class="text-lg mb-2">Total des achats : ${purchaseHistory.reduce((sum, purchase) => sum + purchase.totalAmount, 0).toFixed(2)} XPF</p>
+                <table class="min-w-full bg-white border border-gray-300 rounded-md shadow-sm overflow-hidden">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="py-2 px-4 border-b text-left">Date</th>
+                            <th class="py-2 px-4 border-b text-left">Fournisseur</th>
+                            <th class="py-2 px-4 border-b text-left">Articles Achetés</th>
+                            <th class="py-2 px-4 border-b text-right">Montant Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${purchaseHistory.sort((a, b) => new Date(b.date) - new Date(a.date)).map(purchase => `
+                            <tr class="hover:bg-gray-50">
+                                <td class="py-2 px-4 border-b">${new Date(purchase.date).toLocaleString()}</td>
+                                <td class="py-2 px-4 border-b">${purchase.supplierName}</td>
+                                <td class="py-2 px-4 border-b">
+                                    ${purchase.itemsUpdated.map(item => `${item.name} (x${item.quantity})`).join(', ')}
+                                </td>
+                                <td class="py-2 px-4 border-b text-right">${purchase.totalAmount.toFixed(2)} XPF</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else if (reportType === 'expenses') {
+            title = 'Rapport des Dépenses';
+            content = `
+                <h2 class="text-2xl font-bold mb-4 text-center">Historique des Dépenses</h2>
+                <p class="text-lg mb-2">Total des dépenses : ${expenses.reduce((sum, expense) => sum + expense.totalAmount, 0).toFixed(2)} XPF</p>
+                <table class="min-w-full bg-white border border-gray-300 rounded-md shadow-sm overflow-hidden">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="py-2 px-4 border-b text-left">Date</th>
+                            <th class="py-2 px-4 border-b text-left">Fournisseur</th>
+                            <th class="py-2 px-4 border-b text-left">Détails</th>
+                            <th class="py-2 px-4 border-b text-right">Montant</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${expenses.sort((a, b) => new Date(b.date) - new Date(a.date)).map(expense => `
+                            <tr class="hover:bg-gray-50">
+                                <td class="py-2 px-4 border-b">${new Date(expense.date).toLocaleString()}</td>
+                                <td class="py-2 px-4 border-b">${expense.supplierName}</td>
+                                <td class="py-2 px-4 border-b">${expense.details}</td>
+                                <td class="py-2 px-4 border-b text-right">${expense.totalAmount.toFixed(2)} XPF</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else if (reportType === 'losses') {
+            title = 'Rapport des Pertes';
+            content = `
+                <h2 class="text-2xl font-bold mb-4 text-center">Historique des Pertes</h2>
+                <p class="text-lg mb-2">Total des pertes (valeur estimée) : ${lossHistory.reduce((sum, loss) => sum + loss.lossAmount, 0).toFixed(2)} XPF</p>
+                <table class="min-w-full bg-white border border-gray-300 rounded-md shadow-sm overflow-hidden">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="py-2 px-4 border-b text-left">Date</th>
+                            <th class="py-2 px-4 border-b text-left">Produit</th>
+                            <th class="py-2 px-4 border-b text-right">Quantité Perdue</th>
+                            <th class="py-2 px-4 border-b text-right">Valeur Estimée</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${lossHistory.sort((a, b) => new Date(b.date) - new Date(a.date)).map(loss => `
+                            <tr class="hover:bg-gray-50">
+                                <td class="py-2 px-4 border-b">${new Date(loss.date).toLocaleString()}</td>
+                                <td class="py-2 px-4 border-b">${loss.productName}</td>
+                                <td class="py-2 px-4 border-b text-right">${loss.quantity}</td>
+                                <td class="py-2 px-4 border-b text-right">${loss.lossAmount.toFixed(2)} XPF</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else {
+            setDialog({ message: "Type de rapport non reconnu.", onCancel: () => setDialog(null), showConfirm: false });
+            setIsGeneratingPdf(false);
+            return;
+        }
+
+        const pdfContentElement = document.createElement('div');
+        pdfContentElement.innerHTML = `
+            <style>
+                body { font-family: 'Inter', sans-serif; margin: 0; padding: 0; }
+                .container { width: 100%; max-width: 800px; margin: 0 auto; padding: 20px; }
+                h1, h2 { color: #333; text-align: center; }
+                table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; }
+                .text-right { text-align: right; }
+                .text-center { text-align: center; }
+                .text-lg { font-size: 1.125rem; }
+                .font-bold { font-weight: 700; }
+                .mb-4 { margin-bottom: 1rem; }
+                .mb-2 { margin-bottom: 0.5rem; }
+                .bg-white { background-color: #fff; }
+                .border { border-width: 1px; }
+                .border-gray-300 { border-color: #d1d5db; }
+                .rounded-md { border-radius: 0.375rem; }
+                .shadow-sm { box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
+                .overflow-hidden { overflow: hidden; }
+                .bg-gray-100 { background-color: #f3f4f6; }
+                .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+                .px-4 { padding-left: 1rem; padding-right: 1rem; }
+                .border-b { border-bottom-width: 1px; }
+            </style>
+            <div class="container">
+                <h1 class="text-3xl font-bold mb-6 text-center">${title}</h1>
+                ${content}
+                <p class="text-sm text-gray-500 mt-8 text-center">Généré le: ${new Date().toLocaleString()}</p>
+            </div>
+        `;
+        document.body.appendChild(pdfContentElement); // Temporarily add to DOM for html2canvas
+
+        try {
+            const canvas = await html2canvas(pdfContentElement, { scale: 2, logging: false });
+            const imgData = canvas.toDataURL('image/png');
+            const pdf = new jsPDF('p', 'mm', 'a4');
+            const imgWidth = 210; // A4 width in mm
+            const pageHeight = 297; // A4 height in mm
+            const imgHeight = canvas.height * imgWidth / canvas.width;
+            let heightLeft = imgHeight;
+            let position = 0;
+
+            pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+            heightLeft -= pageHeight;
+
+            while (heightLeft >= 0) {
+                position = heightLeft - imgHeight;
+                pdf.addPage();
+                pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
+                heightLeft -= pageHeight;
+            }
+
+            pdf.save(`${reportType}-report-${new Date().toISOString().slice(0, 10)}.pdf`);
+            setDialog({ message: `Rapport ${title} généré avec succès !`, onCancel: () => setDialog(null), showConfirm: false });
+        } catch (error) {
+            console.error("Error generating PDF:", error);
+            setDialog({ message: `Erreur lors de la génération du rapport ${title}: ` + error.message, onCancel: () => setDialog(null), showConfirm: false });
+        } finally {
+            document.body.removeChild(pdfContentElement); // Clean up
+            setIsGeneratingPdf(false);
+        }
+    };
+
+    if (loading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100 font-inter">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500 mx-auto mb-4"></div>
+                    <p className="text-gray-700 text-lg">Chargement de l'application...</p>
+                </div>
+            </div>
+        );
+    }
+
+    // Main App Render
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4 sm:p-6 lg:p-8 font-inter">
+            {/* Custom Scrollbar Styles component */}
+            <CustomScrollbarStyles />
+            {dialog && <CustomDialog {...dialog} />}
+
+            <header className="flex flex-col sm:flex-row justify-between items-center bg-white p-4 rounded-lg shadow-md mb-6 sticky top-0 z-10">
+                <h1 className="text-2xl sm:text-3xl font-extrabold text-gray-800 mb-2 sm:mb-0">Gestion Commerciale</h1>
+                <div className="text-sm sm:text-base text-gray-600">
+                    ID Utilisateur: <span className="font-mono text-blue-700 break-all">{userId}</span>
+                </div>
+            </header>
+
+            {/* Low Stock Alert */}
+            {lowStockProducts.length > 0 && (
+                <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6 rounded-md shadow-sm animate-pulse-once">
+                    <p className="font-bold">Alertes de Stock Bas :</p>
+                    <ul className="list-disc list-inside">
+                        {lowStockProducts.map(product => (
+                            <li key={product.id} className="text-sm">
+                                <span className="font-semibold">{product.name}</span>: Stock actuel de {product.stock} (Seuil de réapprovisionnement: {product.reorderThreshold})
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+
+            <nav className="bg-blue-600 p-3 rounded-lg shadow-lg mb-6 flex flex-wrap justify-center sm:justify-start gap-2">
+                <TabButton name="Vente" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="Inventaire" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="AchatsMarchandise" displayName="Achats" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="Dépenses" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="Caisse" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="Pertes" activeTab={activeTab} setActiveTab={setActiveTab} />
+                <TabButton name="Bilan" activeTab={activeTab} setActiveTab={setActiveTab} />
+            </nav>
+
+            <main className="bg-white p-4 sm:p-6 rounded-lg shadow-md">
+                {activeTab === 'vente' && (
+                    <section id="vente" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Caisse Enregistreuse</h2>
+                        <div className="flex flex-col lg:flex-row gap-6">
+                            {/* Product List for Sale */}
+                            <div className="flex-1 bg-gray-50 p-4 rounded-md shadow-inner">
+                                <h3 className="text-xl font-semibold text-gray-700 mb-3">Produits Disponibles</h3>
+                                <input
+                                    type="text"
+                                    placeholder="Rechercher un produit..."
+                                    className="p-2 border border-gray-300 rounded-md w-full mb-4 focus:ring-blue-500 focus:border-blue-500"
+                                    value={productSearchTerm}
+                                    onChange={(e) => setProductSearchTerm(e.target.value)}
+                                />
+                                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
+                                    {filteredProducts.length > 0 ? (
+                                        filteredProducts.map(product => (
+                                            <div key={product.id} className="bg-white p-3 rounded-md shadow-sm flex flex-col justify-between items-start border border-gray-200 hover:shadow-md transition duration-200">
+                                                <div>
+                                                    <p className="font-bold text-lg text-gray-800">{product.name}</p>
+                                                    <p className="text-gray-600 text-sm">{product.price.toFixed(2)} XPF</p>
+                                                    <p className="text-gray-500 text-xs">Stock: {product.stock}</p>
+                                                </div>
+                                                <button
+                                                    onClick={() => handleAddToCart(product)}
+                                                    className="mt-2 w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-1.5 px-3 rounded-md transition duration-200 shadow-md transform hover:scale-105"
+                                                >
+                                                    Ajouter au panier
+                                                </button>
+                                            </div>
+                                        ))
+                                    ) : (
+                                        <p className="col-span-full text-center text-gray-500">Aucun produit trouvé.</p>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Cart and Payment */}
+                            <div className="flex-1 bg-blue-50 p-4 rounded-md shadow-inner">
+                                <h3 className="text-xl font-semibold text-gray-700 mb-3">Panier</h3>
+                                {cart.length === 0 ? (
+                                    <p className="text-gray-500">Le panier est vide.</p>
+                                ) : (
+                                    <div className="max-h-60 overflow-y-auto pr-2 mb-4 custom-scrollbar">
+                                        {cart.map(item => (
+                                            <div key={item.id} className="flex justify-between items-center bg-white p-2 rounded-md shadow-sm mb-2 border border-blue-100">
+                                                <div>
+                                                    <p className="font-semibold">{item.name}</p>
+                                                    <p className="text-sm text-gray-600">{item.price.toFixed(2)} XPF x {item.quantity}</p>
+                                                </div>
+                                                <div className="flex items-center space-x-2">
+                                                    <input
+                                                        type="number"
+                                                        min="1"
+                                                        value={item.quantity}
+                                                        onChange={(e) => updateCartItemQuantity(item.id, parseInt(e.target.value) || 0)}
+                                                        className="w-16 p-1 border border-gray-300 rounded-md text-center"
+                                                    />
+                                                    <button
+                                                        onClick={() => handleRemoveFromCart(item.id)}
+                                                        className="text-red-500 hover:text-red-700 p-1 rounded-full hover:bg-red-100 transition duration-200"
+                                                    >
+                                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                                            <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm1 3a1 1 0 100 2h4a1 1 0 100-2H8z" clipRule="evenodd" />
+                                                        </svg>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                                <div className="mt-4 pt-4 border-t border-blue-200">
+                                    <p className="text-xl font-bold text-gray-800 flex justify-between">Total: <span>{calculateCartTotal().toFixed(2)} XPF</span></p>
+                                    <div className="mt-4">
+                                        <label htmlFor="paymentAmount" className="block text-gray-700 text-sm font-bold mb-2">Montant donné par le client (XPF):</label>
+                                        <input
+                                            type="number"
+                                            id="paymentAmount"
+                                            value={paymentAmountGiven}
+                                            onChange={(e) => setPaymentAmountGiven(e.target.value)}
+                                            className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                            step="0.01"
+                                            min="0"
+                                        />
+                                    </div>
+                                    <p className="text-lg font-semibold text-gray-800 mt-2 flex justify-between">Monnaie à rendre: <span className={changeToGive < 0 ? "text-red-500" : "text-green-600"}>{changeToGive.toFixed(2)} XPF</span></p>
+                                    <div className="flex flex-col sm:flex-row gap-3 mt-6">
+                                        <button
+                                            onClick={handleValidateSale}
+                                            className="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105"
+                                        >
+                                            Valider la vente
+                                        </button>
+                                        <button
+                                            onClick={handleCancelSale}
+                                            className="flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105"
+                                        >
+                                            Annuler la vente
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'inventaire' && (
+                    <section id="inventaire" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Gestion de l'Inventaire</h2>
+
+                        {/* Add New Product Form */}
+                        <div className="bg-gray-50 p-4 rounded-md shadow-inner mb-6">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Ajouter un Nouveau Produit</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                <input
+                                    type="text"
+                                    placeholder="Nom du produit"
+                                    value={newProduct.name}
+                                    onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="Prix (XPF)"
+                                    value={newProduct.price}
+                                    onChange={(e) => setNewProduct({ ...newProduct, price: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    step="0.01"
+                                    min="0.01"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="Stock Initial"
+                                    value={newProduct.stock}
+                                    onChange={(e) => setNewProduct({ ...newProduct, stock: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    min="0"
+                                    step="1"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="Seuil de réapprovisionnement"
+                                    value={newProduct.reorderThreshold}
+                                    onChange={(e) => setNewProduct({ ...newProduct, reorderThreshold: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    min="0"
+                                    step="1"
+                                />
+                            </div>
+                            <button
+                                onClick={handleAddProduct}
+                                className="mt-4 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 w-full"
+                            >
+                                Ajouter Produit
+                            </button>
+                        </div>
+
+                        {/* Product List */}
+                        <div className="bg-white p-4 rounded-md shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Liste des Produits</h3>
+                            <input
+                                type="text"
+                                placeholder="Rechercher par nom..."
+                                className="p-2 border border-gray-300 rounded-md w-full mb-4 focus:ring-blue-500 focus:border-blue-500"
+                                value={productSearchTerm}
+                                onChange={(e) => setProductSearchTerm(e.target.value)}
+                            />
+                            <div className="overflow-x-auto custom-scrollbar">
+                                <table className="min-w-full bg-white border border-gray-300 rounded-md shadow-sm">
+                                    <thead className="bg-gray-100">
+                                        <tr>
+                                            <th className="py-2 px-4 border-b text-left">Nom</th>
+                                            <th className="py-2 px-4 border-b text-right">Prix (XPF)</th>
+                                            <th className="py-2 px-4 border-b text-right">Stock</th>
+                                            <th className="py-2 px-4 border-b text-right">Seuil Réappro.</th>
+                                            <th className="py-2 px-4 border-b text-center">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {filteredProducts.length > 0 ? (
+                                            filteredProducts.map(product => (
+                                                <tr key={product.id} className="hover:bg-gray-50">
+                                                    <td className="py-2 px-4 border-b">
+                                                        {editingProduct?.id === product.id ? (
+                                                            <input
+                                                                type="text"
+                                                                value={editingProduct.name}
+                                                                onChange={(e) => setEditingProduct({ ...editingProduct, name: e.target.value })}
+                                                                className="p-1 border border-gray-300 rounded-md w-full"
+                                                            />
+                                                        ) : product.name}
+                                                    </td>
+                                                    <td className="py-2 px-4 border-b text-right">
+                                                        {editingProduct?.id === product.id ? (
+                                                            <input
+                                                                type="number"
+                                                                value={editingProduct.price}
+                                                                onChange={(e) => setEditingProduct({ ...editingProduct, price: e.target.value })}
+                                                                className="p-1 border border-gray-300 rounded-md w-24 text-right"
+                                                                step="0.01"
+                                                                min="0.01"
+                                                            />
+                                                        ) : product.price.toFixed(2)}
+                                                    </td>
+                                                    <td className="py-2 px-4 border-b text-right">
+                                                        {editingProduct?.id === product.id ? (
+                                                            <input
+                                                                type="number"
+                                                                value={editingProduct.stock}
+                                                                onChange={(e) => setEditingProduct({ ...editingProduct, stock: e.target.value })}
+                                                                className="p-1 border border-gray-300 rounded-md w-20 text-right"
+                                                                min="0"
+                                                                step="1"
+                                                            />
+                                                        ) : product.stock}
+                                                    </td>
+                                                    <td className="py-2 px-4 border-b text-right">
+                                                        {editingProduct?.id === product.id ? (
+                                                            <input
+                                                                type="number"
+                                                                value={editingProduct.reorderThreshold}
+                                                                onChange={(e) => setEditingProduct({ ...editingProduct, reorderThreshold: e.target.value })}
+                                                                className="p-1 border border-gray-300 rounded-md w-20 text-right"
+                                                                min="0"
+                                                                step="1"
+                                                            />
+                                                        ) : product.reorderThreshold || 'N/A'}
+                                                    </td>
+                                                    <td className="py-2 px-4 border-b text-center">
+                                                        {editingProduct?.id === product.id ? (
+                                                            <div className="flex justify-center space-x-2">
+                                                                <button
+                                                                    onClick={handleUpdateProduct}
+                                                                    className="bg-blue-500 hover:bg-blue-600 text-white p-1.5 rounded-md text-sm shadow-md transition duration-200"
+                                                                >
+                                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                                        <path d="M7.707 10.293a1 1 0 010-1.414L10.586 6.5a1 1 0 011.414 0l1.414 1.414a1 1 0 010 1.414L10.586 12a1 1 0 01-1.414 0zM7 10a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm1 3a1 1 0 100 2h4a1 1 0 100-2H8z" clipRule="evenodd" />
+                                                                    </svg>
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => setEditingProduct(null)}
+                                                                    className="bg-gray-500 hover:bg-gray-600 text-white p-1.5 rounded-md text-sm shadow-md transition duration-200"
+                                                                >
+                                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                                        <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                                                                    </svg>
+                                                                </button>
+                                                            </div>
+                                                        ) : (
+                                                            <div className="flex justify-center space-x-2">
+                                                                <button
+                                                                    onClick={() => handleEditProduct(product)}
+                                                                    className="bg-yellow-500 hover:bg-yellow-600 text-white p-1.5 rounded-md text-sm shadow-md transition duration-200"
+                                                                >
+                                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                                        <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zm-3.109 5.862a2 2 0 01.372-.676l-.676.372a2 2 0 01-.676.372l-.372-.676a2 2 0 01.372-.676l-.793-.793-2.828-2.828.793-.793a2 2 0 012.828 2.828l.793.793zM16 17a1 1 0 01-1 1H5a1 1 0 01-1-1v-1a1 1 0 011-1h10a1 1 0 011 1v1z" />
+                                                                    </svg>
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => handleDeleteProduct(product.id)}
+                                                                    className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded-md text-sm shadow-md transition duration-200"
+                                                                >
+                                                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                                        <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm1 3a1 1 0 100 2h4a1 1 0 100-2H8z" clipRule="evenodd" />
+                                                                    </svg>
+                                                                </button>
+                                                            </div>
+                                                        )}
+                                                    </td>
+                                                </tr>
+                                            ))
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="5" className="py-4 text-center text-gray-500">Aucun produit dans l'inventaire.</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'achatsmarchandise' && (
+                    <section id="achatsmarchandise" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Achats de Marchandises</h2>
+
+                        {/* Record New Purchase */}
+                        <div className="bg-gray-50 p-4 rounded-md shadow-inner mb-6">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Enregistrer un Nouvel Achat</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                <input
+                                    type="text"
+                                    placeholder="Nom du fournisseur"
+                                    value={newPurchase.supplierName}
+                                    onChange={(e) => setNewPurchase({ ...newPurchase, supplierName: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="Montant Total de l'achat (XPF)"
+                                    value={newPurchase.totalAmount}
+                                    onChange={(e) => setNewPurchase({ ...newPurchase, totalAmount: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    step="0.01"
+                                    min="0.01"
+                                />
+                            </div>
+                            <h4 className="text-lg font-semibold text-gray-700 mb-2">Produits Reçus (mettra à jour le stock)</h4>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 max-h-60 overflow-y-auto pr-2 custom-scrollbar">
+                                {products.length > 0 ? (
+                                    products.map(product => (
+                                        <div key={product.id} className="flex items-center space-x-2 bg-white p-2 rounded-md shadow-sm border border-gray-200">
+                                            <label htmlFor={`purchase-qty-${product.id}`} className="flex-grow text-gray-800">{product.name}</label>
+                                            <input
+                                                id={`purchase-qty-${product.id}`}
+                                                type="number"
+                                                min="0"
+                                                value={newPurchase.productsToUpdate[product.id] || ''}
+                                                onChange={(e) => setNewPurchase(prev => ({
+                                                    ...prev,
+                                                    productsToUpdate: {
+                                                        ...prev.productsToUpdate,
+                                                        [product.id]: parseInt(e.target.value) || 0
+                                                    }
+                                                }))}
+                                                className="w-20 p-1 border border-gray-300 rounded-md text-center focus:ring-blue-500 focus:border-blue-500"
+                                                step="1"
+                                            />
+                                        </div>
+                                    ))
+                                ) : (
+                                    <p className="col-span-full text-gray-500">Aucun produit dans l'inventaire pour ajouter à l'achat.</p>
+                                )}
+                            </div>
+                            <button
+                                onClick={handleAddPurchase}
+                                className="mt-6 bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 w-full"
+                            >
+                                Enregistrer Achat
+                            </button>
+                        </div>
+
+                        {/* Purchase History */}
+                        <div className="bg-white p-4 rounded-md shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Historique des Achats de Marchandises</h3>
+                            <button
+                                onClick={() => generatePDFReport('purchases')}
+                                className="mb-4 bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                disabled={isGeneratingPdf || !pdfLibrariesLoaded || purchaseHistory.length === 0}
+                            >
+                                {isGeneratingPdf ? 'Génération...' : 'Télécharger Rapport PDF'}
+                            </button>
+                            <div className="overflow-x-auto custom-scrollbar">
+                                <table className="min-w-full bg-white border border-gray-300 rounded-md shadow-sm">
+                                    <thead className="bg-gray-100">
+                                        <tr>
+                                            <th className="py-2 px-4 border-b text-left">Date</th>
+                                            <th className="py-2 px-4 border-b text-left">Fournisseur</th>
+                                            <th className="py-2 px-4 border-b text-left">Produits Reçus</th>
+                                            <th className="py-2 px-4 border-b text-right">Montant Total (XPF)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {purchaseHistory.length > 0 ? (
+                                            purchaseHistory.sort((a, b) => new Date(b.date) - new Date(a.date)).map(purchase => (
+                                                <tr key={purchase.id} className="hover:bg-gray-50">
+                                                    <td className="py-2 px-4 border-b">{new Date(purchase.date).toLocaleString()}</td>
+                                                    <td className="py-2 px-4 border-b">{purchase.supplierName}</td>
+                                                    <td className="py-2 px-4 border-b">
+                                                        {purchase.itemsUpdated?.map(item => `${item.name} (x${item.quantity})`).join(', ') || 'N/A'}
+                                                    </td>
+                                                    <td className="py-2 px-4 border-b text-right">{purchase.totalAmount.toFixed(2)}</td>
+                                                </tr>
+                                            ))
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="4" className="py-4 text-center text-gray-500">Aucun achat enregistré.</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'dépenses' && (
+                    <section id="depenses" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Gestion des Dépenses</h2>
+
+                        {/* Record New Expense */}
+                        <div className="bg-gray-50 p-4 rounded-md shadow-inner mb-6">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Enregistrer une Nouvelle Dépense</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                <input
+                                    type="text"
+                                    placeholder="Nom du fournisseur/bénéficiaire"
+                                    value={newExpense.supplierName}
+                                    onChange={(e) => setNewExpense({ ...newExpense, supplierName: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                />
+                                <input
+                                    type="text"
+                                    placeholder="Détails de la dépense (ex: Loyer, Electricité)"
+                                    value={newExpense.details}
+                                    onChange={(e) => setNewExpense({ ...newExpense, details: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="Montant Total de la dépense (XPF)"
+                                    value={newExpense.totalAmount}
+                                    onChange={(e) => setNewExpense({ ...newExpense, totalAmount: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    step="0.01"
+                                    min="0.01"
+                                />
+                            </div>
+                            <button
+                                onClick={handleAddExpense}
+                                className="mt-4 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 w-full"
+                            >
+                                Enregistrer Dépense
+                            </button>
+                        </div>
+
+                        {/* Expense History */}
+                        <div className="bg-white p-4 rounded-md shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Historique des Dépenses</h3>
+                            <button
+                                onClick={() => generatePDFReport('expenses')}
+                                className="mb-4 bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                disabled={isGeneratingPdf || !pdfLibrariesLoaded || expenses.length === 0}
+                                >
+                                {isGeneratingPdf ? 'Génération...' : 'Télécharger Rapport PDF'}
+                            </button>
+                            <div className="overflow-x-auto custom-scrollbar">
+                                <table className="min-w-full bg-white border border-gray-300 rounded-md shadow-sm">
+                                    <thead className="bg-gray-100">
+                                        <tr>
+                                            <th className="py-2 px-4 border-b text-left">Date</th>
+                                            <th className="py-2 px-4 border-b text-left">Fournisseur/Bénéficiaire</th>
+                                            <th className="py-2 px-4 border-b text-left">Détails</th>
+                                            <th className="py-2 px-4 border-b text-right">Montant (XPF)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {expenses.length > 0 ? (
+                                            expenses.sort((a, b) => new Date(b.date) - new Date(a.date)).map(expense => (
+                                                <tr key={expense.id} className="hover:bg-gray-50">
+                                                    <td className="py-2 px-4 border-b">{new Date(expense.date).toLocaleString()}</td>
+                                                    <td className="py-2 px-4 border-b">{expense.supplierName}</td>
+                                                    <td className="py-2 px-4 border-b">{expense.details}</td>
+                                                    <td className="py-2 px-4 border-b text-right">{expense.totalAmount.toFixed(2)}</td>
+                                                </tr>
+                                            ))
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="4" className="py-4 text-center text-gray-500">Aucune dépense enregistrée.</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'caisse' && (
+                    <section id="caisse" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Gestion de la Caisse</h2>
+
+                        {/* Cash Denominations Input */}
+                        <div className="bg-gray-50 p-4 rounded-md shadow-inner mb-6">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Comptage de la Caisse</h3>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                                {Object.keys(cashDenominations).sort((a, b) => parseInt(b) - parseInt(a)).map(denomination => (
+                                    <div key={denomination} className="flex items-center space-x-2">
+                                        <label htmlFor={`denomination-${denomination}`} className="w-1/2 text-right text-gray-700 font-semibold">{denomination} XPF:</label>
+                                        <input
+                                            id={`denomination-${denomination}`}
+                                            type="number"
+                                            min="0"
+                                            value={cashDenominations[denomination]}
+                                            onChange={(e) => handleCashDenominationChange(e.target.value, denomination)}
+                                            className="w-1/2 p-2 border border-gray-300 rounded-md text-center focus:ring-blue-500 focus:border-blue-500"
+                                            step="1"
+                                        />
+                                    </div>
+                                ))}
+                            </div>
+                            <p className="text-xl font-bold text-gray-800 mt-4 pt-4 border-t border-gray-200 flex justify-between">Total Caisse Physique: <span>{calculatePhysicalCashTotal().toFixed(2)} XPF</span></p>
+                            <p className="text-xl font-bold text-blue-700 mt-2 flex justify-between">Caisse Cumulée Théorique: <span>{cumulativeCashInRegister.toFixed(2)} XPF</span></p>
+                            <p className="text-xl font-bold mt-2 flex justify-between">
+                                Écart:
+                                <span className={
+                                    (calculatePhysicalCashTotal() - cumulativeCashInRegister) < 0 ? 'text-red-600' : 'text-green-600'
+                                }>
+                                    {(calculatePhysicalCashTotal() - cumulativeCashInRegister).toFixed(2)} XPF
+                                </span>
+                            </p>
+                            <button
+                                onClick={handleSaveCashCount}
+                                className="mt-6 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 w-full"
+                            >
+                                Enregistrer Comptage Caisse
+                            </button>
+                        </div>
+
+                        {/* Cash Count History */}
+                        <div className="bg-white p-4 rounded-md shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Historique des Comptages de Caisse</h3>
+                            <div className="overflow-x-auto custom-scrollbar">
+                                <table className="min-w-full bg-white border border-gray-300 rounded-md shadow-sm">
+                                    <thead className="bg-gray-100">
+                                        <tr>
+                                            <th className="py-2 px-4 border-b text-left">Date</th>
+                                            <th className="py-2 px-4 border-b text-right">Montant Physique (XPF)</th>
+                                            <th className="py-2 px-4 border-b text-left">Détails Dénominations</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {cashCounts.length > 0 ? (
+                                            cashCounts.sort((a, b) => new Date(b.date) - new Date(a.date)).map(count => (
+                                                <tr key={count.id} className="hover:bg-gray-50">
+                                                    <td className="py-2 px-4 border-b">{new Date(count.date).toLocaleString()}</td>
+                                                    <td className="py-2 px-4 border-b text-right">{count.totalPhysicalAmount.toFixed(2)}</td>
+                                                    <td className="py-2 px-4 border-b">
+                                                        {Object.entries(count.denominations || {}).map(([denom, qty]) =>
+                                                            qty > 0 ? `${qty} x ${denom} XPF` : null
+                                                        ).filter(Boolean).join(', ')}
+                                                    </td>
+                                                </tr>
+                                            ))
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="3" className="py-4 text-center text-gray-500">Aucun comptage de caisse enregistré.</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'pertes' && (
+                    <section id="pertes" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Gestion des Pertes</h2>
+
+                        {/* Record New Loss */}
+                        <div className="bg-gray-50 p-4 rounded-md shadow-inner mb-6">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Enregistrer une Nouvelle Perte de Stock</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                <select
+                                    value={newLoss.productId}
+                                    onChange={(e) => setNewLoss({ ...newLoss, productId: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                >
+                                    <option value="">Sélectionner un produit</option>
+                                    {products.map(product => (
+                                        <option key={product.id} value={product.id}>{product.name} (Stock: {product.stock})</option>
+                                    ))}
+                                </select>
+                                <input
+                                    type="number"
+                                    placeholder="Quantité perdue"
+                                    value={newLoss.quantity}
+                                    onChange={(e) => setNewLoss({ ...newLoss, quantity: e.target.value })}
+                                    className="p-2 border border-gray-300 rounded-md w-full focus:ring-blue-500 focus:border-blue-500"
+                                    min="1"
+                                    step="1"
+                                />
+                            </div>
+                            <button
+                                onClick={handleRecordLoss}
+                                className="mt-4 bg-orange-500 hover:bg-orange-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 w-full"
+                            >
+                                Enregistrer Perte
+                            </button>
+                        </div>
+
+                        {/* Loss History */}
+                        <div className="bg-white p-4 rounded-md shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Historique des Pertes</h3>
+                            <button
+                                onClick={() => generatePDFReport('losses')}
+                                className="mb-4 bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                disabled={isGeneratingPdf || !pdfLibrariesLoaded || lossHistory.length === 0}
+                            >
+                                {isGeneratingPdf ? 'Génération...' : 'Télécharger Rapport PDF'}
+                            </button>
+                            <div className="overflow-x-auto custom-scrollbar">
+                                <table className="min-w-full bg-white border border-gray-300 rounded-md shadow-sm">
+                                    <thead className="bg-gray-100">
+                                        <tr>
+                                            <th className="py-2 px-4 border-b text-left">Date</th>
+                                            <th className="py-2 px-4 border-b text-left">Produit</th>
+                                            <th className="py-2 px-4 border-b text-right">Quantité Perdue</th>
+                                            <th className="py-2 px-4 border-b text-right">Valeur Estimée (XPF)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {lossHistory.length > 0 ? (
+                                            lossHistory.sort((a, b) => new Date(b.date) - new Date(a.date)).map(loss => (
+                                                <tr key={loss.id} className="hover:bg-gray-50">
+                                                    <td className="py-2 px-4 border-b">{new Date(loss.date).toLocaleString()}</td>
+                                                    <td className="py-2 px-4 border-b">{loss.productName}</td>
+                                                    <td className="py-2 px-4 border-b text-right">{loss.quantity}</td>
+                                                    <td className="py-2 px-4 border-b text-right">{loss.lossAmount.toFixed(2)}</td>
+                                                </tr>
+                                            ))
+                                        ) : (
+                                            <tr>
+                                                <td colSpan="4" className="py-4 text-center text-gray-500">Aucune perte enregistrée.</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'bilan' && (
+                    <section id="bilan" className="animate-fade-in">
+                        <h2 className="text-2xl font-bold text-gray-700 mb-4">Bilan & Rapports</h2>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                            {/* Summary Cards */}
+                            <div className="bg-blue-100 p-6 rounded-lg shadow-md border border-blue-200">
+                                <h3 className="text-xl font-semibold text-blue-800 mb-3">Vue d'overview Financière</h3>
+                                <p className="text-lg text-gray-700 mb-2">Total des ventes : <span className="font-bold text-green-700">{salesHistory.reduce((sum, sale) => sum + sale.totalAmount, 0).toFixed(2)} XPF</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Total des achats : <span className="font-bold text-orange-700">{purchaseHistory.reduce((sum, purchase) => sum + purchase.totalAmount, 0).toFixed(2)} XPF</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Total des dépenses : <span className="font-bold text-red-700">{expenses.reduce((sum, expense) => sum + expense.totalAmount, 0).toFixed(2)} XPF</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Pertes de stock estimées : <span className="font-bold text-red-700">{lossHistory.reduce((sum, loss) => sum + loss.lossAmount, 0).toFixed(2)} XPF</span></p>
+                                <p className="text-xl font-bold text-green-900 mt-4 pt-4 border-t border-blue-300">
+                                    Bénéfice Net Estimé: <span className={calculateNetProfit() < 0 ? 'text-red-700' : 'text-green-700'}>{calculateNetProfit().toFixed(2)} XPF</span>
+                                </p>
+                                <p className="text-xl font-bold text-blue-700 mt-2">Caisse Cumulée Théorique: <span className="font-bold">{cumulativeCashInRegister.toFixed(2)} XPF</span></p>
+                            </div>
+
+                            <div className="bg-green-100 p-6 rounded-lg shadow-md border border-green-200">
+                                <h3 className="text-xl font-semibold text-green-800 mb-3">Statistiques Clés</h3>
+                                <p className="text-lg text-gray-700 mb-2">Nombre total de produits : <span className="font-bold">{products.length}</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Articles vendus : <span className="font-bold">{salesHistory.reduce((sum, sale) => sum + JSON.parse(sale.items).reduce((itemSum, item) => itemSum + item.quantity, 0), 0)}</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Bénéfice Brut (simplifié) : <span className="font-bold text-green-700">{calculateGrossProfit().toFixed(2)} XPF</span></p>
+                                <p className="text-lg text-gray-700 mb-2">Produits en faible stock : <span className="font-bold text-orange-700">{lowStockProducts.length}</span></p>
+                            </div>
+                        </div>
+
+                        {/* Reports Section */}
+                        <div className="bg-white p-4 rounded-lg shadow-md">
+                            <h3 className="text-xl font-semibold text-gray-700 mb-3">Générer des Rapports PDF</h3>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                <button
+                                    onClick={() => generatePDFReport('sales')}
+                                    className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    disabled={isGeneratingPdf || !pdfLibrariesLoaded || salesHistory.length === 0}
+                                >
+                                    {isGeneratingPdf ? 'Génération...' : 'Rapport des Ventes'}
+                                </button>
+                                <button
+                                    onClick={() => generatePDFReport('purchases')}
+                                    className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    disabled={isGeneratingPdf || !pdfLibrariesLoaded || purchaseHistory.length === 0}
+                                >
+                                    {isGeneratingPdf ? 'Génération...' : 'Rapport des Achats'}
+                                </button>
+                                <button
+                                    onClick={() => generatePDFReport('expenses')}
+                                    className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    disabled={isGeneratingPdf || !pdfLibrariesLoaded || expenses.length === 0}
+                                >
+                                    {isGeneratingPdf ? 'Génération...' : 'Rapport des Dépenses'}
+                                </button>
+                                <button
+                                    onClick={() => generatePDFReport('losses')}
+                                    className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition duration-200 shadow-md transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    disabled={isGeneratingPdf || !pdfLibrariesLoaded || lossHistory.length === 0}
+                                >
+                                    {isGeneratingPdf ? 'Génération...' : 'Rapport des Pertes'}
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+                )}
+            </main>
+        </div>
+    );
+};
+
+// Reusable Tab Button Component
+const TabButton = ({ name, displayName, activeTab, setActiveTab }) => (
+    <button
+        onClick={() => setActiveTab(name.toLowerCase())}
+        className={`py-2 px-4 rounded-md font-semibold transition-all duration-300 ease-in-out
+            ${activeTab === name.toLowerCase()
+                ? 'bg-white text-blue-700 shadow-md transform scale-105'
+                : 'bg-blue-500 text-white hover:bg-blue-700'
+            }`}
+    >
+        {displayName || name}
+    </button>
+);
+
+export default App;
